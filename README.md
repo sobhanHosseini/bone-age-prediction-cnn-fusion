@@ -1,82 +1,137 @@
-# Bone Age Prediction from Hand Radiographs (CNN Regression + Patch Fusion)
+# Bone Age Estimation from Pediatric Hand Radiographs
 
-Bone age assessment from pediatric hand radiographs is routinely used to estimate skeletal maturity, but manual atlas-based evaluation is time-consuming and subject to inter-observer variability.  
-This project studies bone age estimation as a **supervised regression** task under the constraint of **training CNNs from scratch** (no pretrained backbones). We compare:
-- a lightweight **whole-image** CNN regressor
-- a **patch-based** framework with feature-level fusion (mean vs learned weighting)
-- the impact of **gender metadata** as side information
-
-**Main takeaway:** gender helps a lot; learned patch fusion can improve MAE further, but costs ~10× inference time.
+Lightweight CNNs trained from scratch for bone age prediction under strict no-pretraining constraints. This project investigates uncertainty-aware learning (Deep Label Distribution Learning, DLDL), gender conditioning, and patch-based attention mechanisms on the RSNA Pediatric Bone Age dataset.
 
 ---
 
-## Results (RSNA Validation Split)
+## 🔎 Project Summary
 
-| Model | Description | MAE (months) | Params (M) | Inference (ms/img) |
-|------:|-------------|-------------:|-----------:|-------------------:|
-| M1 | Whole image (no gender) | 15.49 | 0.44 | 0.66 |
-| M2 | Whole image + gender | 11.86 | 0.44 | 0.68 |
-| M3 | Patches + mean fusion (no gender) | 14.21 | 0.44 | 5.38 |
-| M4 | Patches + learned fusion + gender | **10.66** | 0.44 | 5.46 |
+Bone age assessment from hand radiographs is clinically used to evaluate skeletal maturity and diagnose growth disorders. Manual assessment is time-consuming and subject to inter-observer variability.
 
----
+This project formulates bone age estimation as a probabilistic prediction task using **Deep Label Distribution Learning (DLDL)** rather than direct regression. All models are trained entirely from scratch.
 
-## Method Overview
-
-### Whole-image regression
-1. Resize + normalize image
-2. CNN encoder + global average pooling
-3. Regression head → bone age (months)
-4. Optional: concatenate gender indicator before the regression layers
-
-### Patch-based regression with fusion
-1. Resize image
-2. Extract **overlapping patches** (fixed grid)
-3. Shared CNN encoder processes each patch → patch embeddings `{z_k}`
-4. Fuse patch embeddings into a global vector:
-   - **Mean fusion:** `z = (1/K) Σ z_k`
-   - **Learned fusion:** `α_k = softmax(wᵀ z_k)`, `z = Σ α_k z_k`
-5. Optional: concatenate gender after fusion
+Key research questions:
+- How far can lightweight CNNs go without pretrained backbones?
+- Does patch-based attention improve performance under scratch training?
+- How much does gender metadata help?
+- Does uncertainty-aware learning improve stability?
 
 ---
 
-## Dataset
+## 🧠 Methods Overview
 
-RSNA Pediatric Bone Age (hand X-rays, grayscale) with:
-- bone age labels (months)
-- binary gender metadata
+### 1️⃣ Whole-Image Models (M1, M2)
 
-Official splits used:
-- Train: 12,611 images
-- Validation: 1,425 images  
-(Test labels are not public, so test is not used.)
+- Input: resized grayscale radiograph
+- Lightweight CNN encoder (Conv → BN → ReLU blocks)
+- Global Average Pooling
+- Dense(256) → BN → Dropout
+- Final Dense(241) logits (age bins 0–240)
+- Optional gender embedding concatenated before prediction head
 
-> You must obtain the dataset through the official RSNA source / Kaggle competition page. This repo does not redistribute the data.
+### 2️⃣ Patch-Based Models (M3, M4)
+
+- Fixed overlapping grid extraction
+  - Patch size: 128×128
+  - Stride: 64
+  - 9 patches per image (3×3 grid)
+- Shared CNN encoder per patch
+- Attention-based fusion:
+
+**M4 — Learned Softmax Attention**
+- Scalar importance score per patch
+- Softmax normalization across patches
+- Weighted sum of embeddings
+
+**M3 — Gated Attention**
+- Nonlinear transformation: tanh(Vz) ⊙ sigmoid(Uz)
+- Learnable gating before attention scoring
+- More expressive patch weighting
 
 ---
 
-## Preprocessing
+## 📊 Uncertainty-Aware Learning (DLDL)
 
-- Resize images to **256×256**
-- Normalize intensities using **train-set mean/std**
-- Standardize target age during training:
-  - `y' = (y - μ_train) / σ_train`
-- Convert predictions back to months for evaluation
+Instead of regressing a single age value, we predict a probability distribution over discrete age bins (0–240 months).
+
+For each training sample:
+- Construct a Gaussian label distribution centered at the ground-truth age (σ = 4 months)
+- Minimize KL divergence between predicted and target distributions
+- At inference, compute expectation over predicted probabilities:
+
+  ŷ = Σ p(i) · i
+
+Benefits:
+- Models annotation uncertainty
+- Provides smoother gradients
+- Improves optimization stability
+
+---
+
+## ⚙️ Training Setup
+
+- Optimizer: **AdamW** (decoupled weight decay)
+- Learning rate schedule: **Cosine decay**
+- Batch size: 32 (reduced for high-resolution experiments)
+- Early stopping based on validation MAE
+- Mixed precision enabled
+- All models trained under identical preprocessing and optimization settings
+
+---
+
+## 🖼 Preprocessing Pipeline
+
+- Resize to 256×256 (or 512×512 for high-resolution study)
+- CLAHE (clip limit = 2.0, 8×8 tiles)
+- Collimation border masking
+- Radiopaque annotation removal (threshold + morphological opening + inpainting)
+- Dataset-specific Z-score normalization (computed on training set only, excluding background)
 
 No segmentation or anatomical localization is used.
 
 ---
 
-## Training
+## 📈 Results (Validation Split)
 
-- Optimizer: Adam
-- LR: 1e-3
-- Batch size: 32
-- Epochs: up to 20 with early stopping on validation MAE
-- Loss: Huber loss
-- Mixed precision enabled (outputs in float32 for stability)
+| Model | Resolution | MAE (months) | Params (M) |
+|-------|------------|--------------|------------|
+| M1 (Image Only) | 256×256 | 12.17 | 0.71 |
+| M2 (Image + Gender) | 256×256 | 8.36 | 0.72 |
+| M3 (Gated Attention) | 256×256 | 8.81 | 0.79 |
+| M4 (Learned Attention) | 256×256 | 9.37 | 0.72 |
+| **M2 High-Res** | **512×512** | **7.15** | 2.56 |
+| Ensemble (M2+M3+M4) | Mixed | 7.80 | -- |
 
-Patch extraction (patch models):
-- patch size: **128×128**
-- stride: **64**
-- fixed number of patches per image
+### Key Findings
+
+- Gender metadata provides the largest single improvement.
+- Increasing resolution improves performance more than architectural complexity.
+- Patch-based attention improves interpretability but increases inference cost.
+- High-resolution whole-image model (M2 512×512) achieves the best single-model trade-off.
+
+---
+
+## 🔬 Error Analysis
+
+- Errors are stable across most pediatric age groups.
+- Increased MAE observed at the upper end of the age spectrum (late adolescence).
+- Small but consistent gender performance gap.
+
+---
+
+## 📁 Dataset
+
+RSNA Pediatric Bone Age dataset (grayscale hand radiographs with age in months + binary gender).
+
+Official splits:
+- Train: 12,611 images
+- Validation: 1,425 images
+
+⚠️ Dataset is not redistributed. Please obtain it from the official RSNA/Kaggle source.
+
+---
+## 🏁 Final Takeaways
+
+- Under scratch constraints, resolution and data quality matter more than architectural complexity.
+- Uncertainty-aware objectives improve stability in noisy medical labeling settings.
+- Lightweight CNNs can achieve strong performance without pretrained backbones.
